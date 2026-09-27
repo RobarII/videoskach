@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import uuid
 import webbrowser
@@ -41,6 +42,11 @@ import yt_dlp
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+SOCKET_TIMEOUT = 30
+HTTP_CHUNK_SIZE = 10 * 1024 * 1024
+DOWNLOAD_ATTEMPTS = 4
+RETRY_PAUSE_SECONDS = 5
 
 # ---------------------------------------------------------------------------
 # FFmpeg Auto-Locator
@@ -167,6 +173,7 @@ def get_video_info(url: str) -> Dict[str, Any]:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "socket_timeout": SOCKET_TIMEOUT,
     }
     if ffmpeg:
         opts["ffmpeg_location"] = ffmpeg
@@ -248,6 +255,34 @@ def get_video_info(url: str) -> Dict[str, Any]:
 
 tasks_progress: Dict[str, Dict[str, Any]] = {}
 
+NON_RETRYABLE_MARKERS = (
+    "unsupported url",
+    "video unavailable",
+    "this video is unavailable",
+    "private video",
+    "requested format is not available",
+    "sign in to confirm",
+    "не удалось распознать",
+)
+
+
+def is_retryable_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return not any(marker in text for marker in NON_RETRYABLE_MARKERS)
+
+
+def friendly_error(exc: Optional[BaseException]) -> str:
+    text = str(exc) or exc.__class__.__name__
+    low = text.lower()
+    if "timed out" in low or "timeout" in low:
+        return (
+            "Сервер перестал отвечать (таймаут соединения). "
+            "Нажмите «Начать загрузку» ещё раз — файл продолжит качаться с места обрыва."
+        )
+    if "connection" in low or "reset" in low or "temporary failure" in low:
+        return f"Сеть оборвалась: {text}. Попробуйте ещё раз."
+    return text
+
 
 def run_download_task(task_id: str, url: str, quality: str, format_ext: str):
     ffmpeg = get_ffmpeg_path()
@@ -305,6 +340,11 @@ def run_download_task(task_id: str, url: str, quality: str, format_ext: str):
         "no_warnings": True,
         "noplaylist": True,
         "windowsfilenames": True,
+        "socket_timeout": SOCKET_TIMEOUT,
+        "retries": 10,
+        "fragment_retries": 10,
+        "http_chunk_size": HTTP_CHUNK_SIZE,
+        "continuedl": True,
     }
     if ffmpeg:
         opts["ffmpeg_location"] = ffmpeg
@@ -313,34 +353,55 @@ def run_download_task(task_id: str, url: str, quality: str, format_ext: str):
     if postprocessors:
         opts["postprocessors"] = postprocessors
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            prep_name = ydl.prepare_filename(info)
-            base, _ = os.path.splitext(prep_name)
-            final_path = f"{base}.{format_ext}"
-            if not os.path.exists(final_path) and os.path.exists(prep_name):
-                final_path = prep_name
-            if not os.path.exists(final_path) and last_file["path"] and os.path.exists(last_file["path"]):
-                final_path = last_file["path"]
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                prep_name = ydl.prepare_filename(info)
+                base, _ = os.path.splitext(prep_name)
+                final_path = f"{base}.{format_ext}"
+                if not os.path.exists(final_path) and os.path.exists(prep_name):
+                    final_path = prep_name
+                if not os.path.exists(final_path) and last_file["path"] and os.path.exists(last_file["path"]):
+                    final_path = last_file["path"]
 
-            file_size = os.path.getsize(final_path) if os.path.exists(final_path) else 0
-            size_mb = round(file_size / (1024 * 1024), 2)
-            fname = os.path.basename(final_path)
+                file_size = os.path.getsize(final_path) if os.path.exists(final_path) else 0
+                size_mb = round(file_size / (1024 * 1024), 2)
+                fname = os.path.basename(final_path)
 
+                tasks_progress[task_id] = {
+                    "status": "finished",
+                    "percent": 100.0,
+                    "filename": fname,
+                    "file_path": final_path,
+                    "size_mb": size_mb,
+                }
+            return
+        except Exception as e:
+            last_error = e
+            if attempt >= DOWNLOAD_ATTEMPTS or not is_retryable_error(e):
+                break
+            prev = tasks_progress.get(task_id, {})
             tasks_progress[task_id] = {
-                "status": "finished",
-                "percent": 100.0,
-                "filename": fname,
-                "file_path": final_path,
-                "size_mb": size_mb,
+                "status": "retrying",
+                "percent": prev.get("percent", 0.0),
+                "speed": "",
+                "eta": "",
+                "attempt": attempt + 1,
+                "total_attempts": DOWNLOAD_ATTEMPTS,
+                "message": (
+                    f"Соединение прервалось — переподключение "
+                    f"({attempt + 1} из {DOWNLOAD_ATTEMPTS})..."
+                ),
             }
-    except Exception as e:
-        tasks_progress[task_id] = {
-            "status": "error",
-            "percent": 0.0,
-            "error": str(e),
-        }
+            time.sleep(RETRY_PAUSE_SECONDS)
+
+    tasks_progress[task_id] = {
+        "status": "error",
+        "percent": tasks_progress.get(task_id, {}).get("percent", 0.0),
+        "error": friendly_error(last_error),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +837,7 @@ SINGLE_PAGE_HTML = """<!DOCTYPE html>
       startDownloadBtn.disabled = true;
       progressArea.classList.remove('hidden');
       completeBox.classList.add('hidden');
+      progressStatus.classList.remove('text-rose-600');
       progressBar.style.width = '0%';
       progressPercent.textContent = '0%';
       progressStatus.textContent = 'Подключение к видеопотоку...';
@@ -836,6 +898,12 @@ SINGLE_PAGE_HTML = """<!DOCTYPE html>
             progressBar.style.width = '100%';
             progressPercent.textContent = '100%';
             progressStatus.textContent = data.message || 'Объединение дорожек через FFmpeg...';
+          } else if (data.status === 'retrying') {
+            progressBar.style.width = `${data.percent}%`;
+            progressPercent.textContent = `${data.percent}%`;
+            progressSpeed.textContent = '';
+            progressEta.textContent = '';
+            progressStatus.textContent = data.message || 'Переподключение...';
           } else if (data.status === 'finished') {
             clearInterval(pollInterval);
             progressBar.style.width = '100%';
